@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureShield - Scan Results</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: radial-gradient(circle at 20% 50%, #120458 0%, #000000 50%, #1a0033 100%);
+            min-height: 100vh;
+            overflow-x: hidden;
+            perspective: 1000px;
+            position: relative;
+            color: white;
+        }
+
+        /* Animated background particles */
+        .particles {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            pointer-events: none;
+        }
+
+        .particle {
+            position: absolute;
+            width: 2px;
+            height: 2px;
+            background: rgba(102, 126, 234, 0.5);
+            border-radius: 50%;
+            animation: float 6s ease-in-out infinite;
+        }
+
+        @keyframes float {
+
+            0%,
+            100% {
+                transform: translateY(0px) translateX(0px) scale(1);
+                opacity: 0.5;
+            }
+
+            25% {
+                transform: translateY(-20px) translateX(10px) scale(1.2);
+                opacity: 1;
+            }
+
+            50% {
+                transform: translateY(-10px) translateX(-10px) scale(0.8);
+                opacity: 0.7;
+            }
+
+            75% {
+                transform: translateY(-30px) translateX(5px) scale(1.1);
+                opacity: 0.9;
+            }
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        .header-card {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.05));
+            backdrop-filter: blur(20px);
+            border-radius: 25px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
+            transform-style: preserve-3d;
+            transition: all 0.4s ease;
+        }
+
+        .header-card:hover {
+            transform: translateY(-5px) rotateX(2deg) rotateY(2deg);
+            box-shadow: 0 30px 60px rgba(0, 0, 0, 0.4);
+        }
+
+        .scan-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .info-item {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 1.2rem;
+            border-radius: 15px;
+            text-align: center;
+            transform: translateZ(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        .info-item:hover {
+            transform: translateZ(15px);
+            background: rgba(0, 0, 0, 0.4);
+            border-color: rgba(0, 245, 255, 0.3);
+        }
+
+        .info-item h4 {
+            margin-bottom: 0.5rem;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .info-item p {
+            font-size: 1.1rem;
+            font-weight: 500;
+            color: white;
+        }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .result-card {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.05));
+            backdrop-filter: blur(15px);
+            border-radius: 20px;
+            padding: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.4s ease;
+            transform-style: preserve-3d;
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.2);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .result-card:hover {
+            transform: translateY(-8px) rotateX(3deg) rotateY(3deg);
+            box-shadow: 0 25px 50px rgba(0, 245, 255, 0.2);
+            border-color: rgba(0, 245, 255, 0.3);
+        }
+
+        .result-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(0, 245, 255, 0.1), transparent);
+            transition: left 0.6s;
+        }
+
+        .result-card:hover::before {
+            left: 100%;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            color: white;
+        }
+
+        .card-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 1rem;
+            font-size: 1.2rem;
+            background: linear-gradient(135deg, #00f5ff, #667eea);
+            box-shadow: 0 0 15px rgba(0, 245, 255, 0.5);
+        }
+
+        .card-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            text-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+        }
+
+        .vulnerability-list {
+            max-height: 400px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(0, 245, 255, 0.5) transparent;
+        }
+
+        .vulnerability-list::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .vulnerability-list::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+        }
+
+        .vulnerability-list::-webkit-scrollbar-thumb {
+            background: rgba(0, 245, 255, 0.5);
+            border-radius: 3px;
+        }
+
+        .vulnerability-item {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 0.8rem;
+            border-left: 4px solid;
+            transition: all 0.3s ease;
+            position: relative;
+            transform: translateZ(0);
+        }
+
+        .vulnerability-item:hover {
+            transform: translateZ(10px) translateX(5px);
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        .vuln-critical {
+            border-left-color: #ff4d4d;
+        }
+
+        .vuln-high {
+            border-left-color: #ff6b6b;
+        }
+
+        .vuln-medium {
+            border-left-color: #ffa64d;
+        }
+
+        .vuln-low {
+            border-left-color: #4dff88;
+        }
+
+        .vuln-info {
+            border-left-color: #4dc3ff;
+        }
+
+        .vuln-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .vuln-type {
+            font-weight: 600;
+            color: white;
+            font-size: 0.95rem;
+        }
+
+        .vuln-severity {
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: bold;
+        }
+
+        .severity-critical {
+            background: #ff4d4d;
+            color: white;
+        }
+
+        .severity-high {
+            background: #ff6b6b;
+            color: white;
+        }
+
+        .severity-medium {
+            background: #ffa64d;
+            color: white;
+        }
+
+        .severity-low {
+            background: #4dff88;
+            color: white;
+        }
+
+        .severity-info {
+            background: #4dc3ff;
+            color: white;
+        }
+
+        .vuln-evidence {
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+
+        .message-list {
+            color: white;
+        }
+
+        .message-item {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 0.8rem 1rem;
+            border-radius: 10px;
+            margin-bottom: 0.8rem;
+            border-left: 3px solid rgba(0, 245, 255, 0.5);
+            transition: all 0.3s ease;
+            transform: translateZ(0);
+        }
+
+        .message-item:hover {
+            transform: translateZ(5px) translateX(3px);
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        .security-checks {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+        }
+
+        .check-item {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 1rem;
+            border-radius: 10px;
+            text-align: center;
+            transition: all 0.3s ease;
+            transform: translateZ(0);
+            border: 1px solid;
+        }
+
+        .check-item:hover {
+            transform: translateZ(10px) scale(1.05);
+        }
+
+        .check-passed {
+            border-color: #4dff88;
+            color: #4dff88;
+        }
+
+        .check-failed {
+            border-color: #ff6b6b;
+            color: #ff6b6b;
+        }
+
+        .check-icon {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .check-label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-top: 2rem;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 0.8rem 1.5rem;
+            border: none;
+            border-radius: 25px;
+            font-weight: 600;
+            text-decoration: none;
+            text-align: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+            transform: translateZ(0);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            transition: width 0.3s, height 0.3s;
+        }
+
+        .btn:hover::before {
+            width: 300px;
+            height: 300px;
+        }
+
+        .btn:hover {
+            transform: translateZ(10px) translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #00f5ff, #667eea);
+            color: white;
+            box-shadow: 0 5px 15px rgba(0, 245, 255, 0.3);
+        }
+
+        .btn-primary:hover {
+            box-shadow: 0 10px 25px rgba(0, 245, 255, 0.5);
+        }
+
+        .no-vulnerabilities {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.8);
+            padding: 2rem;
+            font-style: italic;
+        }
+
+        .stats-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-item {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 1rem;
+            border-radius: 10px;
+            text-align: center;
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        .stat-item:hover {
+            transform: translateZ(10px);
+            background: rgba(0, 0, 0, 0.4);
+            border-color: rgba(0, 245, 255, 0.3);
+        }
+
+        .stat-number {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+            color: #00f5ff;
+        }
+
+        .stat-label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            opacity: 0.8;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 1rem;
+            }
+
+            .results-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .action-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+
+            .btn {
+                width: 100%;
+                max-width: 300px;
+            }
+        }
+
+        /* 3D mouse movement effects */
+        body:hover .result-card {
+            transition: transform 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .result-card {
+            animation: fadeIn 0.5s ease forwards;
+        }
+
+        .result-card:nth-child(1) {
+            animation-delay: 0.1s;
+        }
+
+        .result-card:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .result-card:nth-child(3) {
+            animation-delay: 0.3s;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="particles" id="particles"></div>
+
+    <div class="container">
+        <div class="header-card">
+            <div class="scan-info">
+                <div class="info-item">
+                    <h4>Scan ID</h4>
+                    <p>{{ result.scan_id }}</p>
+                </div>
+                <div class="info-item">
+                    <h4>Scan Time</h4>
+                    <p>{{ result.scan_time }}</p>
+                </div>
+                {% if result.url %}
+                <div class="info-item">
+                    <h4>Target URL</h4>
+                    <p style="word-break: break-all;">{{ result.url }}</p>
+                </div>
+                {% endif %}
+                <div class="info-item">
+                    <h4>Issues Found</h4>
+                    <p>{{ result.vulnerabilities|length if result.vulnerabilities else 0 }}</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="results-grid">
+            <!-- Vulnerabilities Card -->
+            <div class="result-card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <i class="fas fa-shield-alt"></i>
+                    </div>
+                    <div class="card-title">Vulnerabilities</div>
+                </div>
+
+                {% if result.vulnerabilities %}
+                <div class="stats-summary">
+                    {% set vuln_counts = {} %}
+                    {% for vuln in result.vulnerabilities %}
+                    {% set _ = vuln_counts.update({vuln.severity: vuln_counts.get(vuln.severity, 0) + 1}) %}
+                    {% endfor %}
+
+                    {% for severity in ['critical', 'high', 'medium', 'low', 'info'] %}
+                    {% if vuln_counts.get(severity, 0) > 0 %}
+                    <div class="stat-item">
+                        <div class="stat-number">{{ vuln_counts[severity] }}</div>
+                        <div class="stat-label">{{ severity }}</div>
+                    </div>
+                    {% endif %}
+                    {% endfor %}
+                </div>
+
+                <div class="vulnerability-list">
+                    {% for vuln in result.vulnerabilities %}
+                    <div class="vulnerability-item vuln-{{ vuln.severity }}">
+                        <div class="vuln-header">
+                            <span class="vuln-type">{{ vuln.type }}</span>
+                            <span class="vuln-severity severity-{{ vuln.severity }}">{{ vuln.severity }}</span>
+                        </div>
+                        <div class="vuln-evidence">{{ vuln.evidence if vuln.evidence else "No additional details
+                            available" }}</div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <div class="no-vulnerabilities">
+                    <p><i class="fas fa-check-circle"></i> No vulnerabilities detected!</p>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- Security Checks Card -->
+            {% if result.security_checks %}
+            <div class="result-card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <i class="fas fa-check-double"></i>
+                    </div>
+                    <div class="card-title">Security Checks</div>
+                </div>
+
+                <div class="security-checks">
+                    {% for check, failed in result.security_checks.items() %}
+                    <div class="check-item {{ 'check-failed' if failed else 'check-passed' }}">
+                        <div class="check-icon">{{ '❌' if failed else '✅' }}</div>
+                        <div class="check-label">{{ check.replace('_', ' ').title() }}</div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- Messages Card -->
+            {% if result.message %}
+            <div class="result-card">
+                <div class="card-header">
+                    <div class="card-icon">
+                        <i class="fas fa-info-circle"></i>
+                    </div>
+                    <div class="card-title">Scan Messages</div>
+                </div>
+
+                <div class="message-list">
+                    {% for message in result.message %}
+                    <div class="message-item">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="action-buttons">
+            <a href="/" class="btn btn-primary">
+                <i class="fas fa-home"></i> New Scan
+            </a>
+        </div>
+    </div>
+
+    <script>
+        // Create animated particles
+        function createParticles() {
+            const particlesContainer = document.getElementById('particles');
+            const particleCount = 30;
+
+            for (let i = 0; i < particleCount; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.style.left = Math.random() * 100 + '%';
+                particle.style.top = Math.random() * 100 + '%';
+                particle.style.animationDelay = Math.random() * 6 + 's';
+                particle.style.animationDuration = (Math.random() * 4 + 4) + 's';
+                particlesContainer.appendChild(particle);
+            }
+        }
+
+        // Initialize particles
+        createParticles();
+
+        // 3D mouse movement effects
+        document.addEventListener('mousemove', function (e) {
+            const cards = document.querySelectorAll('.result-card, .header-card');
+            const mouseX = e.clientX / window.innerWidth;
+            const mouseY = e.clientY / window.innerHeight;
+
+            cards.forEach(card => {
+                const rect = card.getBoundingClientRect();
+                const cardX = (rect.left + rect.width / 2) / window.innerWidth;
+                const cardY = (rect.top + rect.height / 2) / window.innerHeight;
+
+                const deltaX = mouseX - cardX;
+                const deltaY = mouseY - cardY;
+
+                const rotateX = deltaY * 5;
+                const rotateY = deltaX * 5;
+
+                card.style.transform = `translateY(-5px) rotateX(${rotateX}deg) rotateY(${rotateY}deg)`;
+            });
+        });
+
+        // Reset transforms when mouse leaves
+        document.addEventListener('mouseleave', function () {
+            const cards = document.querySelectorAll('.result-card, .header-card');
+            cards.forEach(card => {
+                card.style.transform = 'translateY(0) rotateX(0deg) rotateY(0deg)';
+            });
+        });
+    </script>
+</body>
+
+</html>
