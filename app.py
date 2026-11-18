@@ -1,8 +1,8 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify
 import os
 import ipaddress
+import http.client
 import secrets
-import time
 from datetime import datetime
 import ssl
 import socket
@@ -11,14 +11,6 @@ try:
 except ImportError:
     pythonwhois = None
 import re
-try:
-    import selenium.webdriver as webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.common.exceptions import WebDriverException
-except ImportError:
-    webdriver = None
-    Options = None
-    WebDriverException = Exception
 from urllib.parse import urlparse, urljoin
 try:
     import psutil
@@ -26,22 +18,8 @@ except ImportError:
     psutil = None
 import subprocess
 import platform
-from collections import defaultdict
-import warnings
-from urllib3.exceptions import InsecureRequestWarning
-try:
-    import requests
-except ImportError:
-    requests = None
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
+from html.parser import HTMLParser
 import html
-
-# Suppress SSL warnings
-warnings.filterwarnings("ignore", category=InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
@@ -52,6 +30,7 @@ app.config.update(
 )
 
 MAX_SCAN_HISTORY = 100
+MAX_PAGE_SIZE = 2 * 1024 * 1024
 
 
 @app.after_request
@@ -61,47 +40,11 @@ def add_security_headers(response):
     response.headers.setdefault('Referrer-Policy', 'no-referrer')
     return response
 
-# Configure Chrome options to suppress errors
-chrome_options = Options() if Options is not None else None
-if chrome_options is not None:
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-software-rasterizer')
-    chrome_options.add_argument('--log-level=3')
-    chrome_options.add_argument('--disable-extensions')
-    chrome_options.add_argument('--disable-infobars')
-    chrome_options.add_argument('--disable-notifications')
-    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-
-# Disable SSL verification warnings
-try:
-    requests.packages.urllib3.disable_warnings()
-except:
-    pass
-
 # Trusted domains
 TRUSTED_DOMAINS = [
     'google.com', 'youtube.com', 'facebook.com', 'twitter.com',
     'instagram.com', 'linkedin.com', 'microsoft.com', 'apple.com',
     'amazon.com', 'wikipedia.org', 'github.com', 'reddit.com'
-]
-
-# Payloads for testing
-XSS_PAYLOADS = [
-    "<script>alert('XSS')</script>",
-    "<img src=x onerror=alert('XSS')>",
-    "<svg/onload=alert('XSS')>",
-    "'\"><script>alert('XSS')</script>"
-]
-
-SQLI_PAYLOADS = [
-    "' OR '1'='1",
-    "' OR 1=1--",
-    "admin'--",
-    "1' ORDER BY 1--",
-    "1' UNION SELECT null, table_name FROM information_schema.tables--"
 ]
 
 # Vulnerability patterns
@@ -124,7 +67,7 @@ SEVERITY_LEVELS = {
 }
 
 # Scan history in memory
-scan_history = defaultdict(list)
+scan_history = {}
 
 
 def is_trusted_domain(url):
@@ -143,32 +86,113 @@ def normalize_scan_url(raw_url):
         raise ValueError('URL is required')
     if len(raw_url) > 2048:
         raise ValueError('URL is too long')
-    if not raw_url.startswith(('http://', 'https://')):
+    if not raw_url.lower().startswith(('http://', 'https://')):
         raw_url = 'http://' + raw_url
 
     parsed = urlparse(raw_url)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname:
         raise ValueError('Enter a valid HTTP or HTTPS URL')
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None:
         raise ValueError('URLs with embedded credentials are not allowed')
+    if parsed.port == 0:
+        raise ValueError('Enter a valid HTTP or HTTPS URL')
 
     hostname = parsed.hostname.lower().rstrip('.')
-    try:
-        addresses = [
-            ipaddress.ip_address(address[4][0])
-            for address in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
-        ]
-    except (socket.gaierror, OSError, ValueError):
-        raise ValueError('The hostname could not be resolved')
-
-    if not addresses or any(
-        address.is_private or address.is_loopback or address.is_link_local or address.is_reserved
-        or address.is_multicast or address.is_unspecified
-        for address in addresses
-    ):
-        raise ValueError('Private and local network targets are not allowed')
+    _resolve_public_addresses(hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
 
     return raw_url
+
+
+def _resolve_public_addresses(hostname, port):
+    try:
+        records = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError, ValueError) as exc:
+        raise ValueError('The hostname could not be resolved') from exc
+
+    addresses = []
+    for record in records:
+        sockaddr = record[4]
+        if not sockaddr:
+            continue
+        address_text = sockaddr[0]
+        if not isinstance(address_text, str):
+            continue
+        try:
+            address = ipaddress.ip_address(address_text.split('%', 1)[0])
+        except ValueError:
+            continue
+        if not address.is_global:
+            raise ValueError('Private and local network targets are not allowed')
+        if address not in addresses:
+            addresses.append(address)
+
+    if not addresses:
+        raise ValueError('The hostname could not be resolved')
+    return addresses
+
+
+def _open_pinned_connection(parsed_url):
+    hostname = parsed_url.hostname
+    port = parsed_url.port
+    if port == 0:
+        raise ValueError('Invalid target port')
+    port = port or (443 if parsed_url.scheme == 'https' else 80)
+    addresses = _resolve_public_addresses(hostname, port)
+    last_error = None
+
+    for address in addresses:
+        raw_socket = None
+        try:
+            raw_socket = socket.create_connection((str(address), port), timeout=10)
+            if parsed_url.scheme == 'https':
+                context = ssl.create_default_context()
+                return context.wrap_socket(raw_socket, server_hostname=hostname)
+            return raw_socket
+        except OSError as exc:
+            last_error = exc
+            if raw_socket is not None:
+                raw_socket.close()
+
+    raise OSError('Unable to connect to the target') from last_error
+
+
+def _fetch_public_page(url):
+    parsed_url = urlparse(url)
+    connection_socket = _open_pinned_connection(parsed_url)
+    port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+    host_header = f'[{parsed_url.hostname}]' if ':' in parsed_url.hostname else parsed_url.hostname
+    if parsed_url.port:
+        host_header = f'{host_header}:{port}'
+    path = parsed_url.path or '/'
+    if parsed_url.query:
+        path += '?' + parsed_url.query
+
+    connection = None
+    try:
+        connection = http.client.HTTPConnection(parsed_url.hostname, port, timeout=10)
+        connection.sock = connection_socket
+        connection.request('GET', path, headers={
+            'Host': host_header,
+            'Connection': 'close',
+            'Accept-Encoding': 'identity',
+            'User-Agent': 'SecureShield/1.0',
+        })
+        response = connection.getresponse()
+        if 300 <= response.status < 400:
+            raise ValueError('Redirects are not followed')
+        body = response.read(MAX_PAGE_SIZE + 1)
+        if len(body) > MAX_PAGE_SIZE:
+            raise ValueError('The target page is too large to scan')
+        charset = response.headers.get_content_charset() or 'utf-8'
+        certificate = None
+        if isinstance(connection.sock, ssl.SSLSocket):
+            certificate = connection.sock.getpeercert()
+        return body.decode(charset, errors='replace'), certificate
+    finally:
+        if connection is not None:
+            connection.close()
+        else:
+            connection_socket.close()
 
 
 def remember_scan(scan_id, result):
@@ -190,7 +214,7 @@ def get_network_info():
 
         connections = []
         for conn in psutil.net_connections(kind='inet'):
-            if conn.status == 'ESTABLISHED' and conn.raddr:
+            if conn.status == 'ESTABLISHED' and conn.raddr and conn.laddr:
                 try:
                     process = psutil.Process(conn.pid) if conn.pid else None
                     connections.append({
@@ -246,134 +270,63 @@ def get_network_info():
         }
 
 
-def crawl_forms_and_inputs(url):
-    if requests is None or BeautifulSoup is None:
-        return {'error': 'Form crawling is unavailable: requests or beautifulsoup4 is not installed'}
-    try:
-        response = requests.get(url, timeout=10, verify=True, allow_redirects=False)
-        soup = BeautifulSoup(response.text, 'html.parser')
+class PageMarkupParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self.hidden_count = 0
+        self.script_sources = []
+        self.iframe_sources = []
+        self.current_form = None
 
-        forms = []
-        for form in soup.find_all('form'):
-            form_details = {
-                'action': urljoin(url, form.get('action', '')),
-                'method': form.get('method', 'get').upper(),
-                'inputs': []
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        style = (attrs.get('style') or '').replace(' ', '').lower()
+        if 'hidden' in attrs or 'display:none' in style or 'visibility:hidden' in style:
+            self.hidden_count += 1
+
+        if tag == 'form':
+            form = {
+                'action': attrs.get('action', ''),
+                'method': (attrs.get('method') or 'get').upper(),
+                'has_password': False,
             }
+            self.forms.append(form)
+            self.current_form = form
+        elif tag == 'input' and self.current_form is not None:
+            if (attrs.get('type') or '').lower() == 'password':
+                self.current_form['has_password'] = True
+        elif tag == 'script' and attrs.get('src'):
+            self.script_sources.append(attrs['src'])
+        elif tag == 'iframe' and attrs.get('src'):
+            self.iframe_sources.append(attrs['src'])
 
-            for input_tag in form.find_all('input'):
-                input_details = {
-                    'name': input_tag.get('name'),
-                    'type': input_tag.get('type', 'text'),
-                    'value': input_tag.get('value', '')
-                }
-                form_details['inputs'].append(input_details)
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag == 'form':
+            self.current_form = None
 
-            forms.append(form_details)
-
-        return forms
-
-    except Exception as e:
-        return {'error': str(e)}
+    def handle_endtag(self, tag):
+        if tag == 'form':
+            self.current_form = None
 
 
-def test_xss(url, forms):
+def analyze_page_markup(page_source, base_url):
+    parser = PageMarkupParser()
+    parser.feed(page_source)
+    return {
+        'forms': [
+            {**form, 'action': urljoin(base_url, form['action'])}
+            for form in parser.forms
+        ],
+        'hidden_count': parser.hidden_count,
+        'script_sources': [urljoin(base_url, src) for src in parser.script_sources],
+        'iframe_sources': [urljoin(base_url, src) for src in parser.iframe_sources],
+    }
+
+
+def scan_for_vulnerabilities(page_source):
     vulnerabilities = []
-    for form in forms:
-        for input_field in form['inputs']:
-            if input_field['type'] in ('text', 'search', 'textarea', 'password'):
-                for payload in XSS_PAYLOADS:
-                    try:
-                        data = {i['name']: i['value'] for i in form['inputs']}
-                        data[input_field['name']] = payload
-
-                        if form['method'] == 'GET':
-                            response = requests.get(
-                                form['action'], params=data, timeout=10, verify=True, allow_redirects=False)
-                        else:
-                            response = requests.post(
-                                form['action'], data=data, timeout=10, verify=True, allow_redirects=False)
-
-                        # More precise XSS detection
-                        if (payload in response.text and
-                                not any(escape in response.text for escape in ['&lt;', '&gt;', '&amp;'])):
-                            vulnerabilities.append({
-                                'type': 'XSS',
-                                'severity': 'high',
-                                'form_action': form['action'],
-                                'input_name': input_field['name'],
-                                'payload': html.escape(payload),
-                                'evidence': html.escape(response.text[:200] + '...') if len(response.text) > 200 else html.escape(response.text)
-                            })
-
-                    except Exception as e:
-                        continue
-
-    return vulnerabilities
-
-
-def test_sqli(url, forms):
-    vulnerabilities = []
-    for form in forms:
-        for input_field in form['inputs']:
-            if input_field['type'] in ('text', 'search', 'textarea', 'password'):
-                for payload in SQLI_PAYLOADS:
-                    try:
-                        data = {i['name']: i['value'] for i in form['inputs']}
-                        data[input_field['name']] = payload
-
-                        if form['method'] == 'GET':
-                            response = requests.get(
-                                form['action'], params=data, timeout=10, verify=True, allow_redirects=False)
-                        else:
-                            response = requests.post(
-                                form['action'], data=data, timeout=10, verify=True, allow_redirects=False)
-
-                        error_patterns = [
-                            'SQL syntax',
-                            'mysql_fetch',
-                            'syntax error',
-                            'unclosed quotation mark',
-                            'ORA-',
-                            'Microsoft OLE DB Provider'
-                        ]
-
-                        if any(error in response.text for error in error_patterns):
-                            vulnerabilities.append({
-                                'type': 'SQL Injection',
-                                'severity': 'critical',
-                                'form_action': form['action'],
-                                'input_name': input_field['name'],
-                                'payload': html.escape(payload),
-                                'evidence': html.escape(response.text[:200] + '...') if len(response.text) > 200 else html.escape(response.text)
-                            })
-
-                    except Exception as e:
-                        continue
-
-    return vulnerabilities
-
-
-def scan_for_vulnerabilities(url, page_source):
-    vulnerabilities = []
-
-    # Check for reflected XSS in URLs
-    parsed_url = urlparse(url)
-    query_params = parsed_url.query
-    if query_params:
-        for param in query_params.split('&'):
-            if '=' in param:
-                name, value = param.split('=', 1)
-                for payload in XSS_PAYLOADS:
-                    if payload in value:
-                        vulnerabilities.append({
-                            'type': 'Reflected XSS',
-                            'severity': 'high',
-                            'location': 'URL parameter',
-                            'param_name': name,
-                            'payload': html.escape(payload),
-                            'evidence': f"Found in URL parameter: {name}={html.escape(value)}"
-                        })
 
     # Pattern matching in page source
     for vuln_type, pattern in VULN_PATTERNS.items():
@@ -394,7 +347,7 @@ def scan_for_vulnerabilities(url, page_source):
 
 def scan_url(url):
     scan_time = datetime.now().strftime('%B %d, %Y at %H:%M:%S')
-    scan_id = str(int(time.time()))
+    scan_id = secrets.token_urlsafe(12)
 
     try:
         url = normalize_scan_url(url)
@@ -409,41 +362,10 @@ def scan_url(url):
         remember_scan(scan_id, result)
         return result
 
-    if is_trusted_domain(url):
-        result = {
-            'result': 'safe',
-            'message': ['Trusted domain detected'],
-            'scan_time': scan_time,
-            'scan_id': scan_id,
-            'vulnerabilities': []
-        }
-        remember_scan(scan_id, result)
-        return result
-
-    if webdriver is None or chrome_options is None:
-        result = {
-            'result': 'error',
-            'message': ['Browser scanning is unavailable: Selenium is not installed'],
-            'scan_time': scan_time,
-            'scan_id': scan_id,
-            'url': url
-        }
-        remember_scan(scan_id, result)
-        return result
-
-    driver = None
     try:
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(30)
-        driver.get(url)
-        time.sleep(3)
-
-        page_source = driver.page_source.lower()
-        current_url = driver.current_url.lower()
-
+        page_source, certificate = _fetch_public_page(url)
         security_checks = {
             'ssl_issues': False,
-            'new_domain': False,
             'ip_address': False,
             'hidden_elements': False,
             'obfuscated_code': False,
@@ -453,121 +375,86 @@ def scan_url(url):
             'foreign_iframes': False
         }
         messages = []
-        red_flags = 0
         vulnerabilities = []
-
         parsed_url = urlparse(url)
-        domain = parsed_url.netloc
+        domain = parsed_url.hostname
 
-        # SSL Certificate Check
-        try:
-            parsed_url = urlparse(url)
-            if parsed_url.scheme == 'https':
-                context = ssl.create_default_context()
-                port = parsed_url.port or 443
-                with socket.create_connection((domain, port), timeout=10) as sock:
-                    with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                        cert = ssock.getpeercert()
-                        not_after = cert.get('notAfter')
-                        if not_after:
-                            expiry = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
-                            if expiry < datetime.now():
-                                security_checks['ssl_issues'] = True
-                                messages.append("Expired SSL certificate")
-                                red_flags += 3
-                                vulnerabilities.append({
-                                    'type': 'SSL Issue',
-                                    'severity': 'critical',
-                                    'evidence': 'Expired SSL certificate'
-                                })
-        except Exception as e:
-            security_checks['ssl_issues'] = True
-            messages.append(f"SSL error: {str(e)}")
-            red_flags += 3
-            vulnerabilities.append({
-                'type': 'SSL Issue',
-                'severity': 'critical',
-                'evidence': f"SSL error: {str(e)}"
-            })
-
-        # Domain Age Check
-        if pythonwhois is not None:
+        if domain is not None and pythonwhois is not None:
             try:
-                domain_info = pythonwhois.whois(domain)
-                creation_date = domain_info.creation_date
+                creation_date = pythonwhois.whois(domain).creation_date
                 if isinstance(creation_date, list):
                     creation_date = creation_date[0]
-                if creation_date:
-                    domain_age = (datetime.now() - creation_date).days
-                    if domain_age < 7:  # Only flag very new domains
-                        security_checks['new_domain'] = True
-                        messages.append(
-                            f"Very new domain ({domain_age} days) detected")
-                        red_flags += 1
+                if isinstance(creation_date, datetime):
+                    now = datetime.now(creation_date.tzinfo) if creation_date.tzinfo else datetime.now()
+                    domain_age = (now - creation_date).days
+                    security_checks['new_domain'] = domain_age < 7
+                    if domain_age < 7:
                         vulnerabilities.append({
                             'type': 'New Domain',
                             'severity': 'low',
-                            'evidence': f"Domain is only {domain_age} days old"
+                            'evidence': f'Domain is only {domain_age} days old'
                         })
-            except Exception:
+            except Exception as exc:
+                app.logger.warning('Domain age check failed (%s)', type(exc).__name__)
+
+        if certificate:
+            not_after = certificate.get('notAfter')
+            if isinstance(not_after, str) and (
+                    ssl.cert_time_to_seconds(not_after) < datetime.now().timestamp()):
+                security_checks['ssl_issues'] = True
+                messages.append('Expired SSL certificate')
+                vulnerabilities.append({
+                    'type': 'SSL Issue',
+                    'severity': 'critical',
+                    'evidence': 'Expired SSL certificate'
+                })
+
+        if domain is not None:
+            try:
+                ipaddress.ip_address(domain)
+            except ValueError:
                 pass
+            else:
+                security_checks['ip_address'] = True
+                messages.append("IP address in URL")
+                vulnerabilities.append({
+                    'type': 'IP Address in URL',
+                    'severity': 'medium',
+                    'evidence': 'URL contains IP address instead of domain name'
+                })
 
-        # IP Address in URL
-        if re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', domain):
-            security_checks['ip_address'] = True
-            messages.append("IP address in URL")
-            red_flags += 1
-            vulnerabilities.append({
-                'type': 'IP Address in URL',
-                'severity': 'medium',
-                'evidence': 'URL contains IP address instead of domain name'
-            })
-
-        # Hidden Elements
-        hidden_count = driver.execute_script(
-            "return document.querySelectorAll('input[type=hidden], div[style*=\"display:none\"], "
-            "div[style*=\"visibility:hidden\"], *[hidden]').length"
-        )
-        if hidden_count > 5:  # Only flag if excessive hidden elements
+        page_lower = page_source.lower()
+        markup = analyze_page_markup(page_source, url)
+        hidden_count = markup['hidden_count']
+        if hidden_count > 5:
             security_checks['hidden_elements'] = True
-            messages.append(f"Many hidden elements ({hidden_count}) detected")
-            red_flags += 1
             vulnerabilities.append({
                 'type': 'Hidden Elements',
                 'severity': 'low',
                 'evidence': f'Found {hidden_count} hidden elements on the page'
             })
 
-        # Obfuscated Code
         obfuscation_patterns = [
             r'eval\s*\(', r'unescape\s*\(', r'escape\s*\(',
             r'fromCharCode\s*\(', r'exec\s*\(', r'constructor\s*\(',
             r'document\.write\s*\(', r'window\.location\s*='
         ]
         obfuscation_count = sum(1 for pattern in obfuscation_patterns
-                                if re.search(pattern, page_source))
-        if obfuscation_count > 3:  # Only flag if multiple patterns found
+                                if re.search(pattern, page_lower))
+        if obfuscation_count > 3:
             security_checks['obfuscated_code'] = True
-            messages.append(
-                f"Multiple obfuscation patterns detected ({obfuscation_count})")
-            red_flags += 2
             vulnerabilities.append({
                 'type': 'Obfuscated Code',
                 'severity': 'medium',
                 'evidence': f'Found {obfuscation_count} instances of obfuscated code patterns'
             })
 
-        # Suspicious Scripts
-        suspicious_scripts = driver.execute_script(
-            "return Array.from(document.scripts).filter(s => { "
-            "const src = s.src || 'inline'; "
-            "return src !== 'inline' && !src.startsWith('http') && !src.startsWith('https'); "
-            "}).length"
+        suspicious_scripts = sum(
+            urlparse(src).scheme not in ('http', 'https')
+            for src in markup['script_sources']
         )
-        if suspicious_scripts > 0:
+        if suspicious_scripts:
             security_checks['suspicious_scripts'] = True
-            messages.append("Suspicious scripts detected")
-            red_flags += 2
             vulnerabilities.append({
                 'type': 'Suspicious Scripts',
                 'severity': 'high',
@@ -581,83 +468,52 @@ def scan_url(url):
             'sign in', 'authentication', 'security question', 'ssn', 'credit card'
         ]
         keyword_matches = sum(1 for term in phishing_terms
-                              if re.search(rf'\b{re.escape(term)}\b', page_source))
-        if keyword_matches >= 5:  # Only flag if many keywords found
+                              if re.search(rf'\b{re.escape(term)}\b', page_lower))
+        if keyword_matches >= 5:
             security_checks['phishing_keywords'] = True
-            messages.append(
-                f"Multiple phishing terms detected ({keyword_matches})")
-            red_flags += 1
             vulnerabilities.append({
                 'type': 'Phishing Keywords',
                 'severity': 'medium',
                 'evidence': f'Found {keyword_matches} phishing-related keywords'
             })
 
-        # Insecure Forms
-        insecure_forms = driver.execute_script(
-            "return Array.from(document.forms).filter(f => { "
-            "const hasPassword = f.querySelector('input[type=password]') !== null; "
-            "const isSecure = f.action.startsWith('https://') || "
-            "f.action === '' || f.action.startsWith('//'); "
-            "return hasPassword && !isSecure; "
-            "}).length"
+        insecure_forms = sum(
+            form['has_password'] and urlparse(form['action']).scheme != 'https'
+            for form in markup['forms']
         )
-        if insecure_forms > 0:
+        if insecure_forms:
             security_checks['insecure_forms'] = True
-            messages.append(f"Insecure forms detected ({insecure_forms})")
-            red_flags += 2
             vulnerabilities.append({
                 'type': 'Insecure Forms',
                 'severity': 'high',
                 'evidence': 'Found forms with password fields submitted over insecure HTTP'
             })
 
-        # Foreign Iframes
-        foreign_iframes = driver.execute_script(
-            "return Array.from(document.querySelectorAll('iframe')).filter(i => { "
-            "const src = i.src || ''; "
-            "return src && !src.startsWith('http') && !src.startsWith('https'); "
-            "}).length"
-        )
+        foreign_iframes = 0
+        for src in markup['iframe_sources']:
+            iframe_url = urlparse(src)
+            if iframe_url.scheme not in ('http', 'https') or iframe_url.hostname != domain:
+                foreign_iframes += 1
         if foreign_iframes > 0:
             security_checks['foreign_iframes'] = True
-            messages.append(f"Foreign iframes detected ({foreign_iframes})")
-            red_flags += 1
             vulnerabilities.append({
                 'type': 'Foreign Iframes',
                 'severity': 'medium',
                 'evidence': 'Found iframes with suspicious sources'
             })
 
-        # Additional vulnerability scanning
-        forms = crawl_forms_and_inputs(url)
-        if isinstance(forms, dict) and 'error' in forms:
-            messages.append(f"Form crawling error: {forms['error']}")
-        else:
-            # Test for XSS vulnerabilities
-            xss_vulns = test_xss(url, forms)
-            vulnerabilities.extend(xss_vulns)
+        vulnerabilities.extend(scan_for_vulnerabilities(page_lower))
+        red_flags = sum(
+            SEVERITY_LEVELS.get(vuln['severity'], 0) for vuln in vulnerabilities
+        )
 
-            # Test for SQL injection vulnerabilities
-            sqli_vulns = test_sqli(url, forms)
-            vulnerabilities.extend(sqli_vulns)
-
-            # Scan page source for vulnerabilities
-            source_vulns = scan_for_vulnerabilities(url, page_source)
-            vulnerabilities.extend(source_vulns)
-
-            # Update red flags based on found vulnerabilities
-            for vuln in vulnerabilities:
-                red_flags += SEVERITY_LEVELS.get(vuln['severity'], 0)
-
-        # More conservative classification
-        if red_flags >= 4:  # Only mark as unsafe if we have strong evidence
+        if red_flags >= 4:
             result = 'unsafe'
         elif red_flags > 0:
             result = 'suspicious'
         else:
             result = 'safe'
-            messages.append('No security issues detected')
+            messages.append('No issues detected by passive checks')
 
         scan_result = {
             'result': result,
@@ -667,33 +523,23 @@ def scan_url(url):
             'security_checks': security_checks,
             'vulnerabilities': vulnerabilities,
             'url': url,
-            'red_flags': red_flags  # For debugging purposes
+            'red_flags': red_flags
         }
 
         remember_scan(scan_id, scan_result)
         return scan_result
 
-    except WebDriverException as e:
+    except Exception as exc:
+        app.logger.error('URL scan failed (%s)', type(exc).__name__)
         error_result = {
             'result': 'error',
-            'message': [f"WebDriver error: {e}"],
+            'message': ['The target could not be scanned safely'],
             'scan_time': scan_time,
-            'scan_id': scan_id
+            'scan_id': scan_id,
+            'url': url
         }
         remember_scan(scan_id, error_result)
         return error_result
-    except Exception as e:
-        error_result = {
-            'result': 'error',
-            'message': [f"An error occurred: {e}"],
-            'scan_time': scan_time,
-            'scan_id': scan_id
-        }
-        remember_scan(scan_id, error_result)
-        return error_result
-    finally:
-        if driver is not None:
-            driver.quit()
 
 
 @app.route('/')
