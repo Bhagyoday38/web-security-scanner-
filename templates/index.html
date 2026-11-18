@@ -605,8 +605,9 @@
         </div>
 
         <div class="scanner-card">
-            <div class="error-message" style="display: none;" id="errorMessage">
-                <i class="fas fa-exclamation-triangle"></i> <span id="errorText"></span>
+            <div class="error-message"{% if not error %} style="display: none;"{% endif %} id="errorMessage">
+                <i class="fas fa-exclamation-triangle"></i>
+                <span id="errorText">{{ error or '' }}</span>
             </div>
 
             <form class="scan-form" method="POST" action="/scan_url" id="scanForm">

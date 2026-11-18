@@ -1,23 +1,42 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 import os
+import ipaddress
+import secrets
 import time
 from datetime import datetime
 import ssl
 import socket
-import whois as pythonwhois
+try:
+    import whois as pythonwhois
+except ImportError:
+    pythonwhois = None
 import re
-import selenium.webdriver as webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import WebDriverException
+try:
+    import selenium.webdriver as webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.common.exceptions import WebDriverException
+except ImportError:
+    webdriver = None
+    Options = None
+    WebDriverException = Exception
 from urllib.parse import urlparse, urljoin
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import subprocess
 import platform
 from collections import defaultdict
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+except ImportError:
+    requests = None
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 import html
 
 # Suppress SSL warnings
@@ -25,20 +44,36 @@ warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-here-123'  # Change this for production
+app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '').lower() == 'true',
+)
+
+MAX_SCAN_HISTORY = 100
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    return response
 
 # Configure Chrome options to suppress errors
-chrome_options = Options()
-chrome_options.add_argument('--headless')
-chrome_options.add_argument('--disable-gpu')
-chrome_options.add_argument('--no-sandbox')
-chrome_options.add_argument('--disable-dev-shm-usage')
-chrome_options.add_argument('--disable-software-rasterizer')
-chrome_options.add_argument('--log-level=3')
-chrome_options.add_argument('--disable-extensions')
-chrome_options.add_argument('--disable-infobars')
-chrome_options.add_argument('--disable-notifications')
-chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+chrome_options = Options() if Options is not None else None
+if chrome_options is not None:
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-software-rasterizer')
+    chrome_options.add_argument('--log-level=3')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-infobars')
+    chrome_options.add_argument('--disable-notifications')
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
 # Disable SSL verification warnings
 try:
@@ -94,14 +129,61 @@ scan_history = defaultdict(list)
 
 def is_trusted_domain(url):
     parsed_url = urlparse(url)
-    domain = parsed_url.netloc.lower()
+    domain = (parsed_url.hostname or '').lower().rstrip('.')
     for trusted in TRUSTED_DOMAINS:
-        if domain.endswith(trusted):
+        trusted = trusted.lower()
+        if domain == trusted or domain.endswith('.' + trusted):
             return True
     return False
 
 
+def normalize_scan_url(raw_url):
+    raw_url = (raw_url or '').strip()
+    if not raw_url:
+        raise ValueError('URL is required')
+    if len(raw_url) > 2048:
+        raise ValueError('URL is too long')
+    if not raw_url.startswith(('http://', 'https://')):
+        raw_url = 'http://' + raw_url
+
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        raise ValueError('Enter a valid HTTP or HTTPS URL')
+    if parsed.username or parsed.password:
+        raise ValueError('URLs with embedded credentials are not allowed')
+
+    hostname = parsed.hostname.lower().rstrip('.')
+    try:
+        addresses = [
+            ipaddress.ip_address(address[4][0])
+            for address in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+        ]
+    except (socket.gaierror, OSError, ValueError):
+        raise ValueError('The hostname could not be resolved')
+
+    if not addresses or any(
+        address.is_private or address.is_loopback or address.is_link_local or address.is_reserved
+        or address.is_multicast or address.is_unspecified
+        for address in addresses
+    ):
+        raise ValueError('Private and local network targets are not allowed')
+
+    return raw_url
+
+
+def remember_scan(scan_id, result):
+    scan_history[scan_id] = result
+    if len(scan_history) > MAX_SCAN_HISTORY:
+        oldest_id = next(iter(scan_history))
+        scan_history.pop(oldest_id, None)
+
+
 def get_network_info():
+    if psutil is None:
+        return {
+            'error': 'Network scanning is unavailable: psutil is not installed',
+            'success': False
+        }
     try:
         interfaces = psutil.net_if_addrs()
         interface_stats = psutil.net_if_stats()
@@ -165,8 +247,10 @@ def get_network_info():
 
 
 def crawl_forms_and_inputs(url):
+    if requests is None or BeautifulSoup is None:
+        return {'error': 'Form crawling is unavailable: requests or beautifulsoup4 is not installed'}
     try:
-        response = requests.get(url, timeout=10, verify=False)
+        response = requests.get(url, timeout=10, verify=True, allow_redirects=False)
         soup = BeautifulSoup(response.text, 'html.parser')
 
         forms = []
@@ -205,10 +289,10 @@ def test_xss(url, forms):
 
                         if form['method'] == 'GET':
                             response = requests.get(
-                                form['action'], params=data, timeout=10, verify=False)
+                                form['action'], params=data, timeout=10, verify=True, allow_redirects=False)
                         else:
                             response = requests.post(
-                                form['action'], data=data, timeout=10, verify=False)
+                                form['action'], data=data, timeout=10, verify=True, allow_redirects=False)
 
                         # More precise XSS detection
                         if (payload in response.text and
@@ -240,10 +324,10 @@ def test_sqli(url, forms):
 
                         if form['method'] == 'GET':
                             response = requests.get(
-                                form['action'], params=data, timeout=10, verify=False)
+                                form['action'], params=data, timeout=10, verify=True, allow_redirects=False)
                         else:
                             response = requests.post(
-                                form['action'], data=data, timeout=10, verify=False)
+                                form['action'], data=data, timeout=10, verify=True, allow_redirects=False)
 
                         error_patterns = [
                             'SQL syntax',
@@ -312,6 +396,19 @@ def scan_url(url):
     scan_time = datetime.now().strftime('%B %d, %Y at %H:%M:%S')
     scan_id = str(int(time.time()))
 
+    try:
+        url = normalize_scan_url(url)
+    except ValueError as exc:
+        result = {
+            'result': 'error',
+            'message': [str(exc)],
+            'scan_time': scan_time,
+            'scan_id': scan_id,
+            'url': url
+        }
+        remember_scan(scan_id, result)
+        return result
+
     if is_trusted_domain(url):
         result = {
             'result': 'safe',
@@ -320,9 +417,21 @@ def scan_url(url):
             'scan_id': scan_id,
             'vulnerabilities': []
         }
-        scan_history[scan_id] = result
+        remember_scan(scan_id, result)
         return result
 
+    if webdriver is None or chrome_options is None:
+        result = {
+            'result': 'error',
+            'message': ['Browser scanning is unavailable: Selenium is not installed'],
+            'scan_time': scan_time,
+            'scan_id': scan_id,
+            'url': url
+        }
+        remember_scan(scan_id, result)
+        return result
+
+    driver = None
     try:
         driver = webdriver.Chrome(options=chrome_options)
         driver.set_page_load_timeout(30)
@@ -352,50 +461,25 @@ def scan_url(url):
 
         # SSL Certificate Check
         try:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
-            with socket.create_connection((domain, 443), timeout=10) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    cert = ssock.getpeercert()
-                    if not cert:
-                        # Only raise if it's an ecommerce/payment site
-                        if any(kw in url.lower() for kw in ['checkout', 'payment', 'login', 'signin']):
-                            security_checks['ssl_issues'] = True
-                            messages.append(
-                                "Missing SSL certificate on sensitive page")
-                            red_flags += 3
-                            vulnerabilities.append({
-                                'type': 'SSL Issue',
-                                'severity': 'critical',
-                                'evidence': 'Missing SSL certificate on sensitive page'
-                            })
-
-                    not_after = datetime.strptime(
-                        cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                    if not_after < datetime.now():
-                        security_checks['ssl_issues'] = True
-                        messages.append("Expired SSL certificate")
-                        red_flags += 3
-                        vulnerabilities.append({
-                            'type': 'SSL Issue',
-                            'severity': 'critical',
-                            'evidence': 'Expired SSL certificate'
-                        })
-
-                    cert_domains = []
-                    for name in cert.get('subjectAltName', []):
-                        cert_domains.append(name[1].lower())
-                    if domain.lower() not in cert_domains:
-                        security_checks['ssl_issues'] = True
-                        messages.append("SSL domain mismatch")
-                        red_flags += 3
-                        vulnerabilities.append({
-                            'type': 'SSL Issue',
-                            'severity': 'critical',
-                            'evidence': 'SSL domain mismatch'
-                        })
+            parsed_url = urlparse(url)
+            if parsed_url.scheme == 'https':
+                context = ssl.create_default_context()
+                port = parsed_url.port or 443
+                with socket.create_connection((domain, port), timeout=10) as sock:
+                    with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                        cert = ssock.getpeercert()
+                        not_after = cert.get('notAfter')
+                        if not_after:
+                            expiry = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
+                            if expiry < datetime.now():
+                                security_checks['ssl_issues'] = True
+                                messages.append("Expired SSL certificate")
+                                red_flags += 3
+                                vulnerabilities.append({
+                                    'type': 'SSL Issue',
+                                    'severity': 'critical',
+                                    'evidence': 'Expired SSL certificate'
+                                })
         except Exception as e:
             security_checks['ssl_issues'] = True
             messages.append(f"SSL error: {str(e)}")
@@ -407,25 +491,26 @@ def scan_url(url):
             })
 
         # Domain Age Check
-        try:
-            domain_info = pythonwhois.whois(domain)
-            creation_date = domain_info.creation_date
-            if isinstance(creation_date, list):
-                creation_date = creation_date[0]
-            if creation_date:
-                domain_age = (datetime.now() - creation_date).days
-                if domain_age < 7:  # Only flag very new domains
-                    security_checks['new_domain'] = True
-                    messages.append(
-                        f"Very new domain ({domain_age} days) detected")
-                    red_flags += 1
-                    vulnerabilities.append({
-                        'type': 'New Domain',
-                        'severity': 'low',
-                        'evidence': f"Domain is only {domain_age} days old"
-                    })
-        except Exception:
-            pass
+        if pythonwhois is not None:
+            try:
+                domain_info = pythonwhois.whois(domain)
+                creation_date = domain_info.creation_date
+                if isinstance(creation_date, list):
+                    creation_date = creation_date[0]
+                if creation_date:
+                    domain_age = (datetime.now() - creation_date).days
+                    if domain_age < 7:  # Only flag very new domains
+                        security_checks['new_domain'] = True
+                        messages.append(
+                            f"Very new domain ({domain_age} days) detected")
+                        red_flags += 1
+                        vulnerabilities.append({
+                            'type': 'New Domain',
+                            'severity': 'low',
+                            'evidence': f"Domain is only {domain_age} days old"
+                        })
+            except Exception:
+                pass
 
         # IP Address in URL
         if re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', domain):
@@ -565,8 +650,6 @@ def scan_url(url):
             for vuln in vulnerabilities:
                 red_flags += SEVERITY_LEVELS.get(vuln['severity'], 0)
 
-        driver.quit()
-
         # More conservative classification
         if red_flags >= 4:  # Only mark as unsafe if we have strong evidence
             result = 'unsafe'
@@ -587,7 +670,7 @@ def scan_url(url):
             'red_flags': red_flags  # For debugging purposes
         }
 
-        scan_history[scan_id] = scan_result
+        remember_scan(scan_id, scan_result)
         return scan_result
 
     except WebDriverException as e:
@@ -597,7 +680,7 @@ def scan_url(url):
             'scan_time': scan_time,
             'scan_id': scan_id
         }
-        scan_history[scan_id] = error_result
+        remember_scan(scan_id, error_result)
         return error_result
     except Exception as e:
         error_result = {
@@ -606,8 +689,11 @@ def scan_url(url):
             'scan_time': scan_time,
             'scan_id': scan_id
         }
-        scan_history[scan_id] = error_result
+        remember_scan(scan_id, error_result)
         return error_result
+    finally:
+        if driver is not None:
+            driver.quit()
 
 
 @app.route('/')
@@ -617,7 +703,7 @@ def home():
 
 @app.route('/scan_history')
 def show_scan_history():
-    return render_template('scan_history.html', scans=scan_history)
+    return jsonify(dict(scan_history))
 
 
 @app.route('/scan_details/<scan_id>')
@@ -625,7 +711,7 @@ def scan_details(scan_id):
     scan = scan_history.get(scan_id)
     if not scan:
         return "Scan not found", 404
-    return render_template('scan_details.html', scan=scan)
+    return jsonify(scan)
 
 
 @app.route('/choose_scan', methods=['POST'])
@@ -633,34 +719,29 @@ def choose_scan():
     scan_type = request.form.get('type')
 
     if scan_type == 'file':
-        return render_template('upload_file.html')
+        return "File scanning is not available", 400
     elif scan_type == 'url':
-        return render_template('scan_url.html')
+        return render_template('index.html')
     elif scan_type == 'network':
         network_info = get_network_info()
         if not network_info['success']:
-            return render_template('network_scan_results.html',
-                                   error=network_info['error'],
-                                   has_data=False)
-        return render_template('network_scan_results.html',
-                               interfaces=network_info['interfaces'],
-                               interface_stats=network_info['interface_stats'],
-                               connections=network_info['connections'],
-                               arp_table=network_info['arp_table'],
-                               io_counters=network_info['io_counters'],
-                               has_data=True)
+            return jsonify({'error': network_info['error']}), 500
+        return jsonify({
+            'interfaces': network_info['interfaces'],
+            'connections': network_info['connections'],
+            'arp_table': network_info['arp_table'],
+            'io_counters': network_info['io_counters']
+        })
     else:
         return render_template('index.html', error="Invalid scan type selected")
 
 
 @app.route('/scan_url', methods=['POST'])
 def handle_url_scan():
-    url = request.form.get('url')
-    if not url:
-        return render_template('scan_url.html', error="URL is required")
-
-    if not url.startswith(('http://', 'https://')):
-        url = 'http://' + url
+    try:
+        url = normalize_scan_url(request.form.get('url'))
+    except ValueError as exc:
+        return render_template('index.html', error=str(exc)), 400
 
     scan_result = scan_url(url)
     return render_template('result.html', result=scan_result)
@@ -680,4 +761,5 @@ def get_network_data():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=os.environ.get('FLASK_DEBUG', '').lower() == 'true',
+            host=os.environ.get('HOST', '127.0.0.1'), port=int(os.environ.get('PORT', '5000')))
